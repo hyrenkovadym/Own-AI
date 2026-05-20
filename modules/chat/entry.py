@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 
+from .local_llm import OllamaClient
 from .model import NeuralIntentModel
 
 
@@ -29,6 +30,7 @@ class ChatReply:
 class ChatModule:
     name = "chat"
     DEFAULT_FALLBACK_QUEUE_PATH = "modules/chat/data/fallback_queue.json"
+    DEFAULT_CODER_MODEL = "qwen2.5-coder:7b"
 
     def __init__(self) -> None:
         self._kernel = None
@@ -37,6 +39,7 @@ class ChatModule:
         self._sessions: dict[str, deque[str]] = {}
         self._session_bot_names: dict[str, str] = {}
         self._memory_turns = 5
+        self._ollama = OllamaClient()
 
     def on_load(self, kernel) -> None:
         self._kernel = kernel
@@ -130,6 +133,67 @@ class ChatModule:
                 text = f"Я {custom_name}."
         self._remember(session_id, user_text)
         return ChatReply(intent=pred.intent, confidence=pred.confidence, text=text)
+
+    def reply_programmer(
+        self,
+        user_text: str,
+        model_path: str = "models/chat_intent.pkl",
+        confidence_threshold: float = 0.22,
+        session_id: str = "default",
+        coder_model: str = DEFAULT_CODER_MODEL,
+    ) -> ChatReply:
+        text = user_text.strip()
+        if not text:
+            return ChatReply(intent="fallback", confidence=0.0, text="Опиши задачу, і я почну роботу.")
+
+        rename_target = self._extract_custom_name(text)
+        if rename_target is not None:
+            with self._lock:
+                self._session_bot_names[session_id] = rename_target
+            self._remember(session_id, user_text)
+            return ChatReply(
+                intent="set_name",
+                confidence=1.0,
+                text=f"Домовились, можеш називати мене {rename_target}.",
+            )
+
+        if self._is_name_question(text):
+            custom_name = self._get_custom_name(session_id)
+            if custom_name is not None:
+                self._remember(session_id, text)
+                return ChatReply(intent="name", confidence=1.0, text=f"Я {custom_name}.")
+
+        if self._ollama.is_available():
+            system_prompt = (
+                "Ти локальний асистент-програміст у desktop-проєкті користувача. "
+                "Відповідай українською, коротко і практично. "
+                "Для запитів по коду спершу дай міні-план (1-4 кроки), потім робочий код/команди. "
+                "Не вигадуй факти про файли, якщо їх не бачиш."
+            )
+            llm = self._ollama.generate(
+                prompt=text,
+                model=(coder_model or self.DEFAULT_CODER_MODEL).strip(),
+                system=system_prompt,
+                temperature=0.15,
+            )
+            if llm.ok:
+                self._remember(session_id, text)
+                return ChatReply(intent="programmer", confidence=0.99, text=llm.text)
+
+        fallback = self.reply(
+            user_text=text,
+            model_path=model_path,
+            confidence_threshold=confidence_threshold,
+            session_id=session_id,
+        )
+        if fallback.intent == "fallback":
+            msg = (
+                "Я ще не маю локальної coding-моделі або вона вимкнена. "
+                "Щоб отримати режим програміста, запусти Ollama і встанови модель "
+                f"`{self.DEFAULT_CODER_MODEL}`. Потім пиши задачу прямо в чат."
+            )
+            return ChatReply(intent="programmer_unavailable", confidence=0.0, text=msg)
+        return fallback
 
     def teach(
         self,

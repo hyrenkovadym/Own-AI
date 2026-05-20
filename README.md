@@ -45,6 +45,7 @@ Use `Win Score` to define victory target (auto-clamped to board max possible sco
 ```bash
 python main.py train-chat
 python main.py chat --auto-train
+python main.py test-chat
 ```
 
 Teach from chat CLI:
@@ -52,6 +53,28 @@ Teach from chat CLI:
 ```text
 /teach intent | example | response
 ```
+
+## Chat App (simple + programmer mode)
+
+1. Run `python main.py app-chat`
+2. By default use simple chat view (no extra panels).
+3. Enable `Режим розробника` if you want dataset/teaching controls.
+4. Use `Role=programmer` to switch to coding assistant behavior.
+
+Programmer mode uses local Ollama if available:
+
+```bash
+ollama pull qwen2.5-coder:7b
+ollama run qwen2.5-coder:7b
+```
+
+Then return to chat app and keep `Coder model=qwen2.5-coder:7b`.
+If Ollama is not running, app shows a clear fallback hint.
+
+Fallback self-learning queue:
+
+- Unknown/fallback user messages are stored in `modules/chat/data/fallback_queue.json`.
+- In developer mode click `Взяти Fallback` and `Навчити з Fallback` to quickly convert unknown phrases into new training examples.
 
 ## Snake CLI
 

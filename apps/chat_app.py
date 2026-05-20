@@ -20,6 +20,9 @@ class ChatApp(tk.Tk):
         self.kernel = build_kernel()
         self._ui_queue: queue.Queue[tuple[Callable, tuple, dict]] = queue.Queue()
         self._busy = False
+        self._developer_mode = tk.BooleanVar(value=False)
+        self._role_var = tk.StringVar(value="programmer")
+        self._coder_model_var = tk.StringVar(value="qwen2.5-coder:7b")
 
         apply_dark_style(self)
         self._build_layout()
@@ -36,27 +39,47 @@ class ChatApp(tk.Tk):
             text="Окремий застосунок чату. Навчання, діалог і донавчання в одному вікні.",
         ).pack(anchor="w", pady=(2, 12))
 
-        cfg = ttk.LabelFrame(shell, text="Налаштування Моделі", style="Card.TLabelframe", padding=10)
-        cfg.pack(fill=tk.X, pady=(0, 10))
-        cfg.columnconfigure(1, weight=1)
-        cfg.columnconfigure(3, weight=1)
+        mode_row = ttk.Frame(shell)
+        mode_row.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(mode_row, text="Роль:").pack(side=tk.LEFT)
+        role = ttk.Combobox(
+            mode_row,
+            textvariable=self._role_var,
+            values=["programmer", "chat"],
+            state="readonly",
+            width=14,
+        )
+        role.pack(side=tk.LEFT, padx=(8, 12))
+        ttk.Label(mode_row, text="Coder model:").pack(side=tk.LEFT)
+        ttk.Entry(mode_row, textvariable=self._coder_model_var, width=22).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Checkbutton(
+            mode_row,
+            text="Режим розробника",
+            variable=self._developer_mode,
+            command=self._toggle_developer_mode,
+        ).pack(side=tk.RIGHT)
+
+        self.cfg = ttk.LabelFrame(shell, text="Налаштування Моделі", style="Card.TLabelframe", padding=10)
+        self.cfg.pack(fill=tk.X, pady=(0, 10))
+        self.cfg.columnconfigure(1, weight=1)
+        self.cfg.columnconfigure(3, weight=1)
 
         self.dataset_var = tk.StringVar(value="modules/chat/data/intents.json")
         self.model_var = tk.StringVar(value="models/chat_intent.pkl")
         self.threshold_var = tk.StringVar(value="0.25")
         self.session_var = tk.StringVar(value="desktop")
 
-        ttk.Label(cfg, text="Датасет").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(cfg, textvariable=self.dataset_var).grid(row=0, column=1, sticky="ew", pady=4)
-        ttk.Label(cfg, text="Модель").grid(row=0, column=2, sticky="w", padx=(12, 8), pady=4)
-        ttk.Entry(cfg, textvariable=self.model_var).grid(row=0, column=3, sticky="ew", pady=4)
+        ttk.Label(self.cfg, text="Датасет").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(self.cfg, textvariable=self.dataset_var).grid(row=0, column=1, sticky="ew", pady=4)
+        ttk.Label(self.cfg, text="Модель").grid(row=0, column=2, sticky="w", padx=(12, 8), pady=4)
+        ttk.Entry(self.cfg, textvariable=self.model_var).grid(row=0, column=3, sticky="ew", pady=4)
 
-        ttk.Label(cfg, text="Поріг").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(cfg, textvariable=self.threshold_var, width=8).grid(row=1, column=1, sticky="w", pady=4)
-        ttk.Label(cfg, text="Сесія").grid(row=1, column=2, sticky="w", padx=(12, 8), pady=4)
-        ttk.Entry(cfg, textvariable=self.session_var, width=18).grid(row=1, column=3, sticky="w", pady=4)
+        ttk.Label(self.cfg, text="Поріг").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(self.cfg, textvariable=self.threshold_var, width=8).grid(row=1, column=1, sticky="w", pady=4)
+        ttk.Label(self.cfg, text="Сесія").grid(row=1, column=2, sticky="w", padx=(12, 8), pady=4)
+        ttk.Entry(self.cfg, textvariable=self.session_var, width=18).grid(row=1, column=3, sticky="w", pady=4)
 
-        actions = ttk.Frame(cfg)
+        actions = ttk.Frame(self.cfg)
         actions.grid(row=2, column=0, columnspan=4, sticky="e", pady=(8, 0))
         self.train_btn = ttk.Button(actions, text="Навчити", command=self._on_train)
         self.train_btn.pack(side=tk.LEFT, padx=(0, 8))
@@ -93,39 +116,40 @@ class ChatApp(tk.Tk):
         self.send_btn = ttk.Button(input_row, text="Надіслати", command=self._on_send)
         self.send_btn.grid(row=0, column=1)
 
-        teach = ttk.LabelFrame(shell, text="Навчити Прикладом", style="Card.TLabelframe", padding=10)
-        teach.pack(fill=tk.X)
-        teach.columnconfigure(1, weight=1)
-        teach.columnconfigure(3, weight=1)
-        teach.columnconfigure(5, weight=1)
+        self.teach = ttk.LabelFrame(shell, text="Навчити Прикладом", style="Card.TLabelframe", padding=10)
+        self.teach.pack(fill=tk.X)
+        self.teach.columnconfigure(1, weight=1)
+        self.teach.columnconfigure(3, weight=1)
+        self.teach.columnconfigure(5, weight=1)
 
         self.intent_var = tk.StringVar()
         self.example_var = tk.StringVar()
         self.response_var = tk.StringVar()
         self.fallback_status_var = tk.StringVar(value="Fallback-черга: 0 (всього 0)")
 
-        ttk.Label(teach, text="Інтент").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(teach, textvariable=self.intent_var).grid(row=0, column=1, sticky="ew", pady=4)
-        ttk.Label(teach, text="Приклад").grid(row=0, column=2, sticky="w", padx=(12, 8), pady=4)
-        ttk.Entry(teach, textvariable=self.example_var).grid(row=0, column=3, sticky="ew", pady=4)
-        ttk.Label(teach, text="Відповідь").grid(row=0, column=4, sticky="w", padx=(12, 8), pady=4)
-        ttk.Entry(teach, textvariable=self.response_var).grid(row=0, column=5, sticky="ew", pady=4)
+        ttk.Label(self.teach, text="Інтент").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(self.teach, textvariable=self.intent_var).grid(row=0, column=1, sticky="ew", pady=4)
+        ttk.Label(self.teach, text="Приклад").grid(row=0, column=2, sticky="w", padx=(12, 8), pady=4)
+        ttk.Entry(self.teach, textvariable=self.example_var).grid(row=0, column=3, sticky="ew", pady=4)
+        ttk.Label(self.teach, text="Відповідь").grid(row=0, column=4, sticky="w", padx=(12, 8), pady=4)
+        ttk.Entry(self.teach, textvariable=self.response_var).grid(row=0, column=5, sticky="ew", pady=4)
 
-        ttk.Label(teach, textvariable=self.fallback_status_var).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
-        self.pick_fallback_btn = ttk.Button(teach, text="Взяти Fallback", command=self._on_pick_fallback)
+        ttk.Label(self.teach, textvariable=self.fallback_status_var).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.pick_fallback_btn = ttk.Button(self.teach, text="Взяти Fallback", command=self._on_pick_fallback)
         self.pick_fallback_btn.grid(row=1, column=3, sticky="w", pady=(8, 0))
         self.teach_fallback_btn = ttk.Button(
-            teach,
+            self.teach,
             text="Навчити з Fallback",
             command=self._on_teach_from_fallback,
         )
         self.teach_fallback_btn.grid(row=1, column=4, sticky="w", padx=(8, 0), pady=(8, 0))
-        self.teach_btn = ttk.Button(teach, text="Додати + Перенавчити", command=self._on_teach)
+        self.teach_btn = ttk.Button(self.teach, text="Додати + Перенавчити", command=self._on_teach)
         self.teach_btn.grid(row=1, column=5, sticky="e", pady=(8, 0))
 
         self._append("система", "Чат-застосунок готовий.")
         self._append("система", "Порада: якщо відповідь неточна, додай приклад через «Додати + Перенавчити».")
         self._refresh_fallback_status()
+        self._toggle_developer_mode()
 
     def _chat_module(self):
         return self.kernel.load("chat")
@@ -184,12 +208,21 @@ class ChatApp(tk.Tk):
                         f"Модель навчено автоматично ({stats.intents} інтентів, {stats.examples} прикладів).",
                     )
 
-                reply = module.reply(
-                    user_text=text,
-                    model_path=str(model_path),
-                    confidence_threshold=float(self.threshold_var.get().strip()),
-                    session_id=self.session_var.get().strip() or "desktop",
-                )
+                if self._role_var.get().strip() == "programmer":
+                    reply = module.reply_programmer(
+                        user_text=text,
+                        model_path=str(model_path),
+                        confidence_threshold=float(self.threshold_var.get().strip()),
+                        session_id=self.session_var.get().strip() or "desktop",
+                        coder_model=self._coder_model_var.get().strip() or "qwen2.5-coder:7b",
+                    )
+                else:
+                    reply = module.reply(
+                        user_text=text,
+                        model_path=str(model_path),
+                        confidence_threshold=float(self.threshold_var.get().strip()),
+                        session_id=self.session_var.get().strip() or "desktop",
+                    )
                 self._queue_ui(
                     self._append,
                     "бот",
@@ -336,6 +369,19 @@ class ChatApp(tk.Tk):
             self.fallback_status_var.set(f"Fallback-черга: {unique_items} (всього {total_items})")
         except Exception:
             self.fallback_status_var.set("Fallback-черга: n/a")
+
+    def _toggle_developer_mode(self) -> None:
+        dev = bool(self._developer_mode.get())
+        if dev:
+            if not self.cfg.winfo_ismapped():
+                self.cfg.pack(fill=tk.X, pady=(0, 10), before=self.chat_log.master)
+            if not self.teach.winfo_ismapped():
+                self.teach.pack(fill=tk.X)
+        else:
+            if self.cfg.winfo_ismapped():
+                self.cfg.pack_forget()
+            if self.teach.winfo_ismapped():
+                self.teach.pack_forget()
 
     def _on_close(self) -> None:
         try:
