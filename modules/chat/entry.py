@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 
-from .model import NaiveBayesIntentModel
+from .model import NeuralIntentModel
 
 
 @dataclass
@@ -26,12 +28,14 @@ class ChatReply:
 
 class ChatModule:
     name = "chat"
+    DEFAULT_FALLBACK_QUEUE_PATH = "modules/chat/data/fallback_queue.json"
 
     def __init__(self) -> None:
         self._kernel = None
         self._lock = RLock()
-        self._model_cache: dict[str, tuple[float, NaiveBayesIntentModel]] = {}
+        self._model_cache: dict[str, tuple[float, NeuralIntentModel]] = {}
         self._sessions: dict[str, deque[str]] = {}
+        self._session_bot_names: dict[str, str] = {}
         self._memory_turns = 5
 
     def on_load(self, kernel) -> None:
@@ -41,6 +45,7 @@ class ChatModule:
         with self._lock:
             self._model_cache.clear()
             self._sessions.clear()
+            self._session_bot_names.clear()
         self._kernel = None
 
     def train(
@@ -51,7 +56,7 @@ class ChatModule:
     ) -> ChatTrainStats:
         data = self._load_dataset(dataset_path)
         intents = data.get("intents", [])
-        model = NaiveBayesIntentModel(seed=seed)
+        model = NeuralIntentModel(seed=seed)
         model.fit(intents)
         model.save(model_path)
         self._put_model_in_cache(model_path, model)
@@ -74,6 +79,27 @@ class ChatModule:
         confidence_threshold: float = 0.22,
         session_id: str = "default",
     ) -> ChatReply:
+        rename_target = self._extract_custom_name(user_text)
+        if rename_target is not None:
+            with self._lock:
+                self._session_bot_names[session_id] = rename_target
+            self._remember(session_id, user_text)
+            return ChatReply(
+                intent="set_name",
+                confidence=1.0,
+                text=f"Домовились, можеш називати мене {rename_target}.",
+            )
+
+        if self._is_name_question(user_text):
+            custom_name = self._get_custom_name(session_id)
+            if custom_name is not None:
+                self._remember(session_id, user_text)
+                return ChatReply(
+                    intent="name",
+                    confidence=1.0,
+                    text=f"Я {custom_name}.",
+                )
+
         model = self._get_model(model_path)
         pred = model.predict(user_text)
 
@@ -86,6 +112,7 @@ class ChatModule:
                     pred = contextual
 
         if self._should_fallback(pred, confidence_threshold):
+            self._record_fallback(user_text=user_text, session_id=session_id)
             self._remember(session_id, user_text)
             return ChatReply(
                 intent="fallback",
@@ -97,6 +124,10 @@ class ChatModule:
             )
 
         text = model.choose_response(pred.intent)
+        if pred.intent == "name":
+            custom_name = self._get_custom_name(session_id)
+            if custom_name is not None:
+                text = f"Я {custom_name}."
         self._remember(session_id, user_text)
         return ChatReply(intent=pred.intent, confidence=pred.confidence, text=text)
 
@@ -135,9 +166,69 @@ class ChatModule:
 
         self._save_dataset(dataset_path, data)
 
+    def fallback_queue_stats(
+        self,
+        queue_path: str = DEFAULT_FALLBACK_QUEUE_PATH,
+    ) -> tuple[int, int]:
+        queue = self._load_fallback_queue(queue_path)
+        items = queue.get("items", [])
+        unique_items = len(items)
+        total_count = sum(int(item.get("count", 0)) for item in items)
+        return unique_items, total_count
+
+    def fallback_peek(
+        self,
+        queue_path: str = DEFAULT_FALLBACK_QUEUE_PATH,
+    ) -> str | None:
+        queue = self._load_fallback_queue(queue_path)
+        items = queue.get("items", [])
+        if not items:
+            return None
+        sorted_items = sorted(
+            items,
+            key=lambda x: (int(x.get("count", 0)), str(x.get("last_seen", ""))),
+            reverse=True,
+        )
+        text = str(sorted_items[0].get("text", "")).strip()
+        return text or None
+
+    def fallback_consume(
+        self,
+        text: str,
+        queue_path: str = DEFAULT_FALLBACK_QUEUE_PATH,
+        count: int = 1,
+    ) -> bool:
+        target = text.strip()
+        if not target:
+            return False
+        dec = max(1, int(count))
+
+        queue = self._load_fallback_queue(queue_path)
+        items = queue.get("items", [])
+        changed = False
+
+        new_items = []
+        for item in items:
+            item_text = str(item.get("text", "")).strip()
+            item_count = int(item.get("count", 0))
+            if item_text != target:
+                new_items.append(item)
+                continue
+            changed = True
+            remain = item_count - dec
+            if remain > 0:
+                item["count"] = remain
+                new_items.append(item)
+
+        if changed:
+            queue["items"] = new_items
+            self._save_fallback_queue(queue_path, queue)
+        return changed
+
     def reset_session(self, session_id: str = "default") -> None:
         with self._lock:
             self._sessions.pop(session_id, None)
+            self._session_bot_names.pop(session_id, None)
 
     def _remember(self, session_id: str, user_text: str) -> None:
         with self._lock:
@@ -150,6 +241,110 @@ class ChatModule:
         if not session:
             return user_text
         return " ".join(session + [user_text])
+
+    def _get_custom_name(self, session_id: str) -> str | None:
+        with self._lock:
+            return self._session_bot_names.get(session_id)
+
+    @staticmethod
+    def _is_name_question(text: str) -> bool:
+        low = text.strip().lower()
+        markers = (
+            "як тебе звати",
+            "як твоє ім",
+            "твоє ім",
+            "хто ти",
+            "ти хто",
+            "як тебе називати",
+        )
+        return any(m in low for m in markers)
+
+    @staticmethod
+    def _extract_custom_name(text: str) -> str | None:
+        raw = text.strip()
+        if not raw:
+            return None
+
+        patterns = (
+            r"(?:давай(?:\s+тебе)?(?:\s+буде)?\s+звати)\s+([A-Za-zА-Яа-яІіЇїЄєҐґ][A-Za-zА-Яа-яІіЇїЄєҐґ0-9'_-]{1,31})",
+            r"(?:пропоную\s+тебе\s+назвати)\s+([A-Za-zА-Яа-яІіЇїЄєҐґ][A-Za-zА-Яа-яІіЇїЄєҐґ0-9'_-]{1,31})",
+            r"(?:тепер\s+тебе\s+звати)\s+([A-Za-zА-Яа-яІіЇїЄєҐґ][A-Za-zА-Яа-яІіЇїЄєҐґ0-9'_-]{1,31})",
+            r"(?:ми\s+тебе(?:\s+ж)?\s+називали)\s+([A-Za-zА-Яа-яІіЇїЄєҐґ][A-Za-zА-Яа-яІіЇїЄєҐґ0-9'_-]{1,31})",
+            r"(?:називали\s+тебе)\s+([A-Za-zА-Яа-яІіЇїЄєҐґ][A-Za-zА-Яа-яІіЇїЄєҐґ0-9'_-]{1,31})",
+            r"(?:я\s+)?називатиму\s+тебе\s+([A-Za-zА-Яа-яІіЇїЄєҐґ][A-Za-zА-Яа-яІіЇїЄєҐґ0-9'_-]{1,31})",
+            r"(?:називатиму\s+тебе)\s+([A-Za-zА-Яа-яІіЇїЄєҐґ][A-Za-zА-Яа-яІіЇїЄєҐґ0-9'_-]{1,31})",
+            r"(?:будеш\s+мати\s+ім(?:'|’|`)?я)\s+([A-Za-zА-Яа-яІіЇїЄєҐґ][A-Za-zА-Яа-яІіЇїЄєҐґ0-9'_-]{1,31})",
+            r"^(?:ні[,\s]+)?ти\s+([A-Za-zА-Яа-яІіЇїЄєҐґ][A-Za-zА-Яа-яІіЇїЄєҐґ0-9'_-]{1,31})$",
+        )
+
+        for pattern in patterns:
+            m = re.search(pattern, raw, flags=re.IGNORECASE)
+            if m is None:
+                continue
+            candidate = m.group(1).strip(" .,!?:;\"'`()[]{}")
+            if not candidate:
+                continue
+            low = candidate.lower()
+            if low in {
+                "ти",
+                "тебе",
+                "імя",
+                "ім'я",
+                "ім’я",
+                "бот",
+                "хто",
+                "що",
+                "як",
+                "де",
+                "коли",
+                "чому",
+                "навіщо",
+                "who",
+                "what",
+                "why",
+                "how",
+            }:
+                continue
+            return candidate
+
+        return None
+
+    def _record_fallback(
+        self,
+        user_text: str,
+        session_id: str,
+        queue_path: str = DEFAULT_FALLBACK_QUEUE_PATH,
+    ) -> None:
+        text = user_text.strip()
+        if len(text) < 2:
+            return
+
+        queue = self._load_fallback_queue(queue_path)
+        items = queue.get("items", [])
+        now = datetime.now(timezone.utc).isoformat()
+
+        found = False
+        for item in items:
+            if str(item.get("text", "")).strip().lower() == text.lower():
+                item["text"] = text
+                item["count"] = int(item.get("count", 0)) + 1
+                item["last_seen"] = now
+                item["last_session"] = session_id
+                found = True
+                break
+
+        if not found:
+            items.append(
+                {
+                    "text": text,
+                    "count": 1,
+                    "last_seen": now,
+                    "last_session": session_id,
+                }
+            )
+
+        queue["items"] = items
+        self._save_fallback_queue(queue_path, queue)
 
     @staticmethod
     def _should_fallback(pred, confidence_threshold: float) -> bool:
@@ -177,14 +372,14 @@ class ChatModule:
 
         return False
 
-    def _put_model_in_cache(self, model_path: str, model: NaiveBayesIntentModel) -> None:
+    def _put_model_in_cache(self, model_path: str, model: NeuralIntentModel) -> None:
         path = Path(model_path)
         resolved = str(path.resolve())
         mtime = path.stat().st_mtime
         with self._lock:
             self._model_cache[resolved] = (mtime, model)
 
-    def _get_model(self, model_path: str) -> NaiveBayesIntentModel:
+    def _get_model(self, model_path: str) -> NeuralIntentModel:
         path = Path(model_path)
         if not path.exists():
             raise FileNotFoundError(f"Файл моделі не знайдено: {model_path}")
@@ -196,7 +391,7 @@ class ChatModule:
             if cached is not None and cached[0] == mtime:
                 return cached[1]
 
-        model = NaiveBayesIntentModel.load(path)
+        model = NeuralIntentModel.load(path)
         with self._lock:
             self._model_cache[resolved] = (mtime, model)
         return model
@@ -212,6 +407,33 @@ class ChatModule:
     @staticmethod
     def _save_dataset(dataset_path: str, data: dict) -> None:
         path = Path(dataset_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+
+    @staticmethod
+    def _load_fallback_queue(queue_path: str) -> dict:
+        path = Path(queue_path)
+        if not path.exists():
+            return {"items": []}
+
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return {"items": []}
+
+        if not isinstance(data, dict):
+            return {"items": []}
+        items = data.get("items", [])
+        if not isinstance(items, list):
+            return {"items": []}
+        return {"items": items}
+
+    @staticmethod
+    def _save_fallback_queue(queue_path: str, data: dict) -> None:
+        path = Path(queue_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)

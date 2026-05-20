@@ -102,6 +102,7 @@ class ChatApp(tk.Tk):
         self.intent_var = tk.StringVar()
         self.example_var = tk.StringVar()
         self.response_var = tk.StringVar()
+        self.fallback_status_var = tk.StringVar(value="Fallback-черга: 0 (всього 0)")
 
         ttk.Label(teach, text="Інтент").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
         ttk.Entry(teach, textvariable=self.intent_var).grid(row=0, column=1, sticky="ew", pady=4)
@@ -109,11 +110,22 @@ class ChatApp(tk.Tk):
         ttk.Entry(teach, textvariable=self.example_var).grid(row=0, column=3, sticky="ew", pady=4)
         ttk.Label(teach, text="Відповідь").grid(row=0, column=4, sticky="w", padx=(12, 8), pady=4)
         ttk.Entry(teach, textvariable=self.response_var).grid(row=0, column=5, sticky="ew", pady=4)
+
+        ttk.Label(teach, textvariable=self.fallback_status_var).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.pick_fallback_btn = ttk.Button(teach, text="Взяти Fallback", command=self._on_pick_fallback)
+        self.pick_fallback_btn.grid(row=1, column=3, sticky="w", pady=(8, 0))
+        self.teach_fallback_btn = ttk.Button(
+            teach,
+            text="Навчити з Fallback",
+            command=self._on_teach_from_fallback,
+        )
+        self.teach_fallback_btn.grid(row=1, column=4, sticky="w", padx=(8, 0), pady=(8, 0))
         self.teach_btn = ttk.Button(teach, text="Додати + Перенавчити", command=self._on_teach)
         self.teach_btn.grid(row=1, column=5, sticky="e", pady=(8, 0))
 
         self._append("система", "Чат-застосунок готовий.")
         self._append("система", "Порада: якщо відповідь неточна, додай приклад через «Додати + Перенавчити».")
+        self._refresh_fallback_status()
 
     def _chat_module(self):
         return self.kernel.load("chat")
@@ -140,6 +152,7 @@ class ChatApp(tk.Tk):
                         f"словник={stats.vocab_size}, модель={stats.model_path}"
                     ),
                 )
+                self._queue_ui(self._refresh_fallback_status)
             except Exception as exc:  # noqa: BLE001
                 self._queue_ui(messagebox.showerror, "Помилка Навчання Чату", str(exc))
             finally:
@@ -182,6 +195,7 @@ class ChatApp(tk.Tk):
                     "бот",
                     f"{reply.text} (intent={reply.intent}, conf={reply.confidence:.2f})",
                 )
+                self._queue_ui(self._refresh_fallback_status)
             except Exception as exc:  # noqa: BLE001
                 self._queue_ui(messagebox.showerror, "Помилка Чату", str(exc))
 
@@ -218,6 +232,7 @@ class ChatApp(tk.Tk):
                 self._queue_ui(self.intent_var.set, "")
                 self._queue_ui(self.example_var.set, "")
                 self._queue_ui(self.response_var.set, "")
+                self._queue_ui(self._refresh_fallback_status)
             except Exception as exc:  # noqa: BLE001
                 self._queue_ui(messagebox.showerror, "Помилка Донавчання", str(exc))
             finally:
@@ -233,11 +248,69 @@ class ChatApp(tk.Tk):
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Помилка Скидання Сесії", str(exc))
 
+    def _on_pick_fallback(self) -> None:
+        try:
+            top = self._chat_module().fallback_peek()
+            if not top:
+                self._append("система", "Fallback-черга порожня.")
+                self._refresh_fallback_status()
+                return
+            self.example_var.set(top)
+            self._append("система", f"Підставлено fallback: {top}")
+            self._refresh_fallback_status()
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Помилка Fallback-Черги", str(exc))
+
+    def _on_teach_from_fallback(self) -> None:
+        if self._busy:
+            return
+
+        intent = self.intent_var.get().strip()
+        response = self.response_var.get().strip()
+        if not intent or not response:
+            messagebox.showwarning("Навчити з Fallback", "Заповни інтент і відповідь.")
+            return
+
+        self._set_busy(True)
+        self._append("система", f"Донавчаю з fallback для інтенту '{intent}'...")
+
+        def worker() -> None:
+            try:
+                module = self._chat_module()
+                example = module.fallback_peek()
+                if not example:
+                    self._queue_ui(self._append, "система", "Fallback-черга порожня.")
+                    return
+
+                module.teach(
+                    intent=intent,
+                    example=example,
+                    response=response,
+                    dataset_path=self.dataset_var.get().strip(),
+                )
+                module.fallback_consume(example)
+                module.train(
+                    dataset_path=self.dataset_var.get().strip(),
+                    model_path=self.model_var.get().strip(),
+                    seed=42,
+                )
+                self._queue_ui(self._append, "система", f"Додано приклад з fallback: {example}")
+                self._queue_ui(self.example_var.set, "")
+                self._queue_ui(self._refresh_fallback_status)
+            except Exception as exc:  # noqa: BLE001
+                self._queue_ui(messagebox.showerror, "Помилка Навчання з Fallback", str(exc))
+            finally:
+                self._queue_ui(self._set_busy, False)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
         state = tk.DISABLED if busy else tk.NORMAL
         self.train_btn.configure(state=state)
         self.teach_btn.configure(state=state)
+        self.pick_fallback_btn.configure(state=state)
+        self.teach_fallback_btn.configure(state=state)
         self.send_btn.configure(state=state)
         self.reset_btn.configure(state=state)
 
@@ -256,6 +329,13 @@ class ChatApp(tk.Tk):
                 break
             fn(*args, **kwargs)
         self.after(80, self._drain_ui_queue)
+
+    def _refresh_fallback_status(self) -> None:
+        try:
+            unique_items, total_items = self._chat_module().fallback_queue_stats()
+            self.fallback_status_var.set(f"Fallback-черга: {unique_items} (всього {total_items})")
+        except Exception:
+            self.fallback_status_var.set("Fallback-черга: n/a")
 
     def _on_close(self) -> None:
         try:

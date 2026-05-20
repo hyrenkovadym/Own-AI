@@ -4,15 +4,11 @@ import math
 import pickle
 import random
 import re
-from collections import Counter, defaultdict
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 from pathlib import Path
-
 
 TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яІіЇїЄєҐґ0-9']+", flags=re.UNICODE)
 
-# Легкі службові слова, щоб модель краще фокусувалась на змісті.
 STOPWORDS = {
     "і",
     "й",
@@ -89,8 +85,7 @@ STOPWORDS = {
 
 def _normalize_text(text: str) -> str:
     t = text.strip().lower()
-    # Уніфікуємо різні типи апострофів.
-    t = t.replace("’", "'").replace("`", "'").replace("ʼ", "'").replace("ʹ", "'")
+    t = t.replace("’", "'").replace("`", "'").replace("ʼ", "'")
     return t
 
 
@@ -115,52 +110,104 @@ class Prediction:
     token_count: int = 0
 
 
-class NaiveBayesIntentModel:
-    def __init__(self, alpha: float = 1.0, seed: int | None = None) -> None:
-        self.alpha = alpha
+class NeuralIntentModel:
+    """A tiny MLP intent classifier trained from local examples.
+
+    Architecture:
+    - bag-of-words input
+    - hidden tanh layer
+    - softmax output
+
+    No external API and no heavy deps required.
+    """
+
+    MODEL_TYPE = "mlp_intent_v1"
+
+    def __init__(
+        self,
+        hidden_size: int = 24,
+        learning_rate: float = 0.06,
+        epochs: int = 240,
+        l2: float = 1e-5,
+        seed: int | None = None,
+    ) -> None:
+        self.hidden_size = max(4, int(hidden_size))
+        self.learning_rate = float(learning_rate)
+        self.epochs = max(20, int(epochs))
+        self.l2 = max(0.0, float(l2))
         self.rng = random.Random(seed)
 
-        self.intent_doc_counts: Counter[str] = Counter()
-        self.intent_word_counts: dict[str, Counter[str]] = defaultdict(Counter)
-        self.intent_total_words: Counter[str] = Counter()
-        self.vocab: set[str] = set()
         self.responses: dict[str, list[str]] = {}
         self.example_phrases: dict[str, str] = {}
-        self.example_records: list[tuple[str, str, set[str]]] = []
-        self.total_docs = 0
+        self.vocab: list[str] = []
+        self.vocab_index: dict[str, int] = {}
+        self.token_vocab: set[str] = set()
+        self.intent_to_idx: dict[str, int] = {}
+        self.idx_to_intent: list[str] = []
+
+        self.W1: list[list[float]] = []
+        self.b1: list[float] = []
+        self.W2: list[list[float]] = []
+        self.b2: list[float] = []
 
     def fit(self, intents: list[dict[str, object]]) -> None:
-        self.intent_doc_counts.clear()
-        self.intent_word_counts = defaultdict(Counter)
-        self.intent_total_words.clear()
-        self.vocab.clear()
         self.responses = {}
         self.example_phrases = {}
-        self.example_records = []
-        self.total_docs = 0
+
+        docs: list[tuple[list[str], str]] = []
+        vocab_set: set[str] = set()
+        token_vocab_set: set[str] = set()
 
         for intent_entry in intents:
-            name = str(intent_entry["name"])
+            intent_name = str(intent_entry.get("name", "")).strip()
+            if not intent_name:
+                continue
+
             examples = [str(x) for x in intent_entry.get("examples", [])]
             responses = [str(x) for x in intent_entry.get("responses", [])]
-            self.responses[name] = responses
+            if responses:
+                self.responses[intent_name] = responses
 
             for text in examples:
+                phrase = normalize_phrase(text)
+                if phrase and phrase not in self.example_phrases:
+                    self.example_phrases[phrase] = intent_name
+
                 tokens = tokenize(text)
                 if not tokens:
                     continue
-                phrase = normalize_phrase(text)
-                if phrase and phrase not in self.example_phrases:
-                    self.example_phrases[phrase] = name
-                self.example_records.append((phrase, name, set(tokens)))
-                self.total_docs += 1
-                self.intent_doc_counts[name] += 1
-                self.intent_word_counts[name].update(tokens)
-                self.intent_total_words[name] += len(tokens)
-                self.vocab.update(tokens)
+                token_vocab_set.update(tokens)
 
-        if self.total_docs == 0:
+                features = self._extract_features(tokens=tokens, phrase=phrase)
+                docs.append((features, intent_name))
+                vocab_set.update(features)
+
+        if not docs:
             raise ValueError("У датасеті не знайдено прикладів для навчання.")
+
+        self.vocab = sorted(vocab_set)
+        self.vocab_index = {tok: i for i, tok in enumerate(self.vocab)}
+        self.token_vocab = token_vocab_set
+
+        intents_sorted = sorted({intent for _, intent in docs})
+        self.idx_to_intent = intents_sorted
+        self.intent_to_idx = {intent: i for i, intent in enumerate(intents_sorted)}
+
+        X_sparse: list[list[tuple[int, float]]] = []
+        y: list[int] = []
+
+        for features, intent_name in docs:
+            sparse = self._vectorize_sparse(features)
+            if not sparse:
+                continue
+            X_sparse.append(sparse)
+            y.append(self.intent_to_idx[intent_name])
+
+        if not X_sparse:
+            raise ValueError("Після токенізації не лишилось даних для навчання.")
+
+        self._init_weights(input_size=len(self.vocab), num_classes=len(self.idx_to_intent))
+        self._train_sgd(X_sparse, y)
 
     def predict(self, text: str) -> Prediction:
         raw_tokens = tokenize(text, drop_stopwords=False)
@@ -179,162 +226,250 @@ class NaiveBayesIntentModel:
                 token_count=len(raw_tokens),
             )
 
-        # 1) Fuzzy-матч до прикладів: дає кращу стійкість до опечаток.
-        fuzzy_intent, fuzzy_conf, fuzzy_known_ratio = self._fuzzy_match(phrase=phrase, tokens=tokens)
-        if fuzzy_intent is not None and fuzzy_conf >= 0.86:
-            return Prediction(
-                intent=fuzzy_intent,
-                confidence=fuzzy_conf,
-                margin=max(0.0, fuzzy_conf - 0.55),
-                known_token_ratio=fuzzy_known_ratio,
-                token_count=len(raw_tokens),
-            )
+        if not self.W1 or not self.W2:
+            return Prediction(intent="fallback", confidence=0.0, margin=0.0, known_token_ratio=0.0, token_count=len(raw_tokens))
 
-        if not tokens:
-            return Prediction(
-                intent="fallback",
-                confidence=0.0,
-                margin=0.0,
-                known_token_ratio=0.0,
-                token_count=len(raw_tokens),
-            )
-
-        known_tokens = [t for t in tokens if t in self.vocab]
+        known_tokens = [t for t in tokens if t in self.token_vocab]
         known_ratio = (len(known_tokens) / len(raw_tokens)) if raw_tokens else 0.0
 
-        # Якщо є середній fuzzy і майже невідомі слова, краще взяти fuzzy-клас.
-        if fuzzy_intent is not None and fuzzy_conf >= 0.70 and known_ratio < 0.25:
-            return Prediction(
-                intent=fuzzy_intent,
-                confidence=min(0.92, fuzzy_conf),
-                margin=max(0.0, fuzzy_conf - 0.50),
-                known_token_ratio=max(known_ratio, fuzzy_known_ratio),
-                token_count=len(raw_tokens),
-            )
-
         if not known_tokens:
-            return Prediction(
-                intent="fallback",
-                confidence=0.0,
-                margin=0.0,
-                known_token_ratio=0.0,
-                token_count=len(raw_tokens),
-            )
+            return Prediction(intent="fallback", confidence=0.0, margin=0.0, known_token_ratio=0.0, token_count=len(raw_tokens))
 
-        intents = list(self.intent_doc_counts.keys())
-        if not intents:
-            return Prediction(
-                intent="fallback",
-                confidence=0.0,
-                margin=0.0,
-                known_token_ratio=0.0,
-                token_count=len(raw_tokens),
-            )
+        features = self._extract_features(tokens=tokens, phrase=phrase)
+        known_features = [f for f in features if f in self.vocab_index]
+        if not known_features:
+            return Prediction(intent="fallback", confidence=0.0, margin=0.0, known_token_ratio=known_ratio, token_count=len(raw_tokens))
 
-        # 2) Класичний Naive Bayes по токенах.
-        vocab_size = max(1, len(self.vocab))
-        scores: dict[str, float] = {}
-        for intent in intents:
-            prior = math.log(self.intent_doc_counts[intent] / self.total_docs)
-            score = prior
+        x_sparse = self._vectorize_sparse(known_features)
+        probs = self._forward_probs(x_sparse)
+        if not probs:
+            return Prediction(intent="fallback", confidence=0.0, margin=0.0, known_token_ratio=known_ratio, token_count=len(raw_tokens))
 
-            total_words = self.intent_total_words[intent]
-            word_counts = self.intent_word_counts[intent]
-            for token in known_tokens:
-                token_count = word_counts[token]
-                prob = (token_count + self.alpha) / (total_words + self.alpha * vocab_size)
-                score += math.log(prob)
-            scores[intent] = score
-
-        sorted_items = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        best_intent, best_score = sorted_items[0]
-
-        shifted = {k: math.exp(v - best_score) for k, v in scores.items()}
-        denom = sum(shifted.values())
-        probs = {k: (val / denom if denom > 0 else 0.0) for k, val in shifted.items()}
-        best_conf = probs.get(best_intent, 0.0)
-
-        second_conf = 0.0
-        if len(sorted_items) > 1:
-            second_intent = sorted_items[1][0]
-            second_conf = probs.get(second_intent, 0.0)
-
-        # Легка поправка на fuzzy, якщо він збігається з NB.
-        if fuzzy_intent == best_intent and fuzzy_conf >= 0.60:
-            best_conf = min(0.98, 0.82 * best_conf + 0.18 * fuzzy_conf)
+        best_idx = max(range(len(probs)), key=lambda i: probs[i])
+        best_conf = probs[best_idx]
+        sorted_probs = sorted(probs, reverse=True)
+        second_conf = sorted_probs[1] if len(sorted_probs) > 1 else 0.0
 
         return Prediction(
-            intent=best_intent,
+            intent=self.idx_to_intent[best_idx],
             confidence=best_conf,
             margin=max(0.0, best_conf - second_conf),
             known_token_ratio=known_ratio,
             token_count=len(raw_tokens),
         )
 
-    def _fuzzy_match(self, phrase: str, tokens: list[str]) -> tuple[str | None, float, float]:
-        if not phrase or not self.example_records:
-            return None, 0.0, 0.0
-
-        token_set = set(tokens)
-        best_intent: str | None = None
-        best_score = 0.0
-        best_known_ratio = 0.0
-
-        for ex_phrase, ex_intent, ex_tokens in self.example_records:
-            char_sim = SequenceMatcher(None, phrase, ex_phrase).ratio()
-            if not token_set and not ex_tokens:
-                token_sim = 1.0
-            else:
-                union = token_set | ex_tokens
-                token_sim = (len(token_set & ex_tokens) / len(union)) if union else 0.0
-
-            # Символи + токени разом.
-            score = 0.62 * char_sim + 0.38 * token_sim
-            if score > best_score:
-                best_score = score
-                best_intent = ex_intent
-                best_known_ratio = token_sim
-
-        return best_intent, best_score, best_known_ratio
-
     def choose_response(self, intent: str) -> str:
         options = self.responses.get(intent, [])
         if not options:
             return "Я ще не знаю. Спробуй перефразувати або навчи мене через /teach."
-        return self.rng.choice(options)
+        base = self.rng.choice(options)
+
+        # Tiny response composer: creates richer replies without external LLM.
+        addons = self._response_addons().get(intent, [])
+        if addons and self.rng.random() < 0.45:
+            addon = self.rng.choice(addons)
+            if addon not in base:
+                return f"{base} {addon}"
+        return base
 
     def save(self, path: str | Path) -> None:
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+
         data = {
-            "alpha": self.alpha,
-            "intent_doc_counts": dict(self.intent_doc_counts),
-            "intent_word_counts": {k: dict(v) for k, v in self.intent_word_counts.items()},
-            "intent_total_words": dict(self.intent_total_words),
-            "vocab": list(self.vocab),
+            "model_type": self.MODEL_TYPE,
+            "hidden_size": self.hidden_size,
+            "learning_rate": self.learning_rate,
+            "epochs": self.epochs,
+            "l2": self.l2,
             "responses": self.responses,
             "example_phrases": self.example_phrases,
-            "example_records": [(p, i, list(t)) for p, i, t in self.example_records],
-            "total_docs": self.total_docs,
+            "vocab": self.vocab,
+            "token_vocab": sorted(self.token_vocab),
+            "idx_to_intent": self.idx_to_intent,
+            "W1": self.W1,
+            "b1": self.b1,
+            "W2": self.W2,
+            "b2": self.b2,
         }
-        with path.open("wb") as f:
+
+        with p.open("wb") as f:
             pickle.dump(data, f)
 
     @classmethod
-    def load(cls, path: str | Path) -> "NaiveBayesIntentModel":
+    def load(cls, path: str | Path) -> "NeuralIntentModel":
         with Path(path).open("rb") as f:
             data = pickle.load(f)
 
-        model = cls(alpha=data.get("alpha", 1.0))
-        model.intent_doc_counts = Counter(data.get("intent_doc_counts", {}))
-        model.intent_word_counts = defaultdict(Counter)
-        for k, v in data.get("intent_word_counts", {}).items():
-            model.intent_word_counts[k] = Counter(v)
-        model.intent_total_words = Counter(data.get("intent_total_words", {}))
-        model.vocab = set(data.get("vocab", []))
+        model_type = data.get("model_type") if isinstance(data, dict) else None
+        if model_type != cls.MODEL_TYPE:
+            if isinstance(data, dict) and "intent_doc_counts" in data:
+                raise ValueError(
+                    "Знайдено модель старого формату (Naive Bayes). "
+                    "Натисни 'Навчити', щоб створити нейромережеву модель у новому форматі."
+                )
+            raise ValueError("Невідомий формат моделі. Перенавчи модель кнопкою 'Навчити'.")
+
+        model = cls(
+            hidden_size=int(data.get("hidden_size", 24)),
+            learning_rate=float(data.get("learning_rate", 0.06)),
+            epochs=int(data.get("epochs", 240)),
+            l2=float(data.get("l2", 1e-5)),
+        )
         model.responses = data.get("responses", {})
         model.example_phrases = data.get("example_phrases", {})
-        raw_records = data.get("example_records", [])
-        model.example_records = [(p, i, set(t)) for p, i, t in raw_records]
-        model.total_docs = int(data.get("total_docs", 0))
+        model.vocab = list(data.get("vocab", []))
+        model.vocab_index = {tok: i for i, tok in enumerate(model.vocab)}
+        model.token_vocab = set(data.get("token_vocab", model.vocab))
+        model.idx_to_intent = list(data.get("idx_to_intent", []))
+        model.intent_to_idx = {intent: i for i, intent in enumerate(model.idx_to_intent)}
+        model.W1 = [list(row) for row in data.get("W1", [])]
+        model.b1 = list(data.get("b1", []))
+        model.W2 = [list(row) for row in data.get("W2", [])]
+        model.b2 = list(data.get("b2", []))
         return model
+
+    def _init_weights(self, input_size: int, num_classes: int) -> None:
+        scale1 = 1.0 / math.sqrt(max(1, input_size))
+        scale2 = 1.0 / math.sqrt(max(1, self.hidden_size))
+
+        self.W1 = [
+            [(self.rng.random() * 2.0 - 1.0) * scale1 for _ in range(self.hidden_size)]
+            for _ in range(input_size)
+        ]
+        self.b1 = [0.0 for _ in range(self.hidden_size)]
+
+        self.W2 = [
+            [(self.rng.random() * 2.0 - 1.0) * scale2 for _ in range(num_classes)]
+            for _ in range(self.hidden_size)
+        ]
+        self.b2 = [0.0 for _ in range(num_classes)]
+
+    def _vectorize_sparse(self, tokens: list[str]) -> list[tuple[int, float]]:
+        counts: dict[int, float] = {}
+        for tok in tokens:
+            idx = self.vocab_index.get(tok)
+            if idx is None:
+                continue
+            counts[idx] = counts.get(idx, 0.0) + 1.0
+
+        if not counts:
+            return []
+
+        length = float(len(tokens)) if tokens else 1.0
+        return sorted((idx, val / length) for idx, val in counts.items())
+
+    @staticmethod
+    def _extract_features(tokens: list[str], phrase: str) -> list[str]:
+        features: list[str] = []
+        features.extend(f"w:{t}" for t in tokens)
+
+        # Token bigrams help with short phrase meaning.
+        for i in range(len(tokens) - 1):
+            features.append(f"bg:{tokens[i]}_{tokens[i + 1]}")
+
+        compact = phrase.replace(" ", "")
+        if len(compact) >= 3:
+            # Char trigrams help with typos and inflections.
+            for i in range(len(compact) - 2):
+                tri = compact[i : i + 3]
+                if " " in tri:
+                    continue
+                features.append(f"cg:{tri}")
+
+        return features
+
+    @staticmethod
+    def _response_addons() -> dict[str, list[str]]:
+        return {
+            "greeting": ["Радий бачити тебе в чаті."],
+            "thanks": ["Звертайся, якщо хочеш ще прокачати модель."],
+            "capabilities": ["Можу донавчатися прямо на твоїх прикладах."],
+            "why": ["Якщо хочеш, можу пояснити це крок за кроком."],
+        }
+
+    def _forward_hidden(self, x_sparse: list[tuple[int, float]]) -> list[float]:
+        z1 = self.b1.copy()
+        for idx, val in x_sparse:
+            row = self.W1[idx]
+            for j in range(self.hidden_size):
+                z1[j] += val * row[j]
+        return [math.tanh(v) for v in z1]
+
+    def _forward_probs(self, x_sparse: list[tuple[int, float]]) -> list[float]:
+        h = self._forward_hidden(x_sparse)
+
+        z2 = self.b2.copy()
+        for j in range(self.hidden_size):
+            hj = h[j]
+            row = self.W2[j]
+            for k in range(len(z2)):
+                z2[k] += hj * row[k]
+
+        m = max(z2)
+        exps = [math.exp(v - m) for v in z2]
+        denom = sum(exps)
+        if denom <= 0.0:
+            return [0.0 for _ in z2]
+        return [e / denom for e in exps]
+
+    def _train_sgd(self, X_sparse: list[list[tuple[int, float]]], y: list[int]) -> None:
+        n = len(X_sparse)
+        class_count = len(self.idx_to_intent)
+
+        indices = list(range(n))
+        for _ in range(self.epochs):
+            self.rng.shuffle(indices)
+            for sample_idx in indices:
+                x = X_sparse[sample_idx]
+                target = y[sample_idx]
+
+                h = self._forward_hidden(x)
+
+                z2 = self.b2.copy()
+                for j in range(self.hidden_size):
+                    hj = h[j]
+                    row = self.W2[j]
+                    for k in range(class_count):
+                        z2[k] += hj * row[k]
+
+                m = max(z2)
+                exps = [math.exp(v - m) for v in z2]
+                denom = sum(exps)
+                probs = [e / denom for e in exps]
+
+                delta2 = probs
+                delta2[target] -= 1.0
+
+                delta1 = [0.0 for _ in range(self.hidden_size)]
+                for j in range(self.hidden_size):
+                    back = 0.0
+                    row = self.W2[j]
+                    for k in range(class_count):
+                        back += row[k] * delta2[k]
+                    delta1[j] = (1.0 - h[j] * h[j]) * back
+
+                lr = self.learning_rate
+
+                for j in range(self.hidden_size):
+                    row = self.W2[j]
+                    hj = h[j]
+                    for k in range(class_count):
+                        grad = hj * delta2[k] + self.l2 * row[k]
+                        row[k] -= lr * grad
+
+                for k in range(class_count):
+                    self.b2[k] -= lr * delta2[k]
+
+                for input_idx, xval in x:
+                    row = self.W1[input_idx]
+                    for j in range(self.hidden_size):
+                        grad = xval * delta1[j] + self.l2 * row[j]
+                        row[j] -= lr * grad
+
+                for j in range(self.hidden_size):
+                    self.b1[j] -= lr * delta1[j]
+
+
+# Backward-compatible name used by entry.py
+NaiveBayesIntentModel = NeuralIntentModel

@@ -8,4 +8,4 @@ venv/
 env/
 models/
 *.log
-
+modules/chat/data/fallback_queue.json

@@ -153,6 +153,63 @@ def cmd_chat(kernel: Kernel, args: argparse.Namespace) -> None:
         print(f"бот> {reply.text} (intent={reply.intent}, conf={reply.confidence:.2f})")
 
 
+def cmd_test_chat(kernel: Kernel, args: argparse.Namespace) -> None:
+    module = kernel.load("chat")
+    stats = module.train(
+        dataset_path=args.dataset_path,
+        model_path=args.model_path,
+        seed=args.seed,
+    )
+    print(
+        "[чат-тест] "
+        f"model trained: intents={stats.intents}, examples={stats.examples}, vocab={stats.vocab_size}"
+    )
+
+    cases = [
+        ("привіт", "greeting"),
+        ("привітос", "greeting"),
+        ("що ти можеш", "capabilities"),
+        ("чому так", "why"),
+        ("дякую", "thanks"),
+        ("спс", "thanks"),
+        ("давай тебе буде звати Timo", "set_name"),
+        ("хто ти", "name"),
+        ("ти хто", "name"),
+        ("но ми тебе ж називали Тімо", "set_name"),
+        ("хто ти", "name"),
+        ("тепер тебе звати Тімо", "set_name"),
+        ("ні ти Timo", "set_name"),
+        ("як навчити тебе краще", "train_help"),
+        ("хто тебе створив", "creator"),
+        ("до побачення", "bye"),
+        ("до звязку", "bye"),
+        ("на все добре", "bye"),
+        ("який курс біткоїна зараз", "fallback"),
+    ]
+
+    session_id = "benchmark"
+    passed = 0
+    for idx, (question, expected_intent) in enumerate(cases, start=1):
+        reply = module.reply(
+            user_text=question,
+            model_path=args.model_path,
+            confidence_threshold=args.threshold,
+            session_id=session_id,
+        )
+        ok = reply.intent == expected_intent
+        if ok:
+            passed += 1
+        status = "OK" if ok else "MISS"
+        print(
+            f"[{idx:02d}] {status} "
+            f"q='{question}' -> intent={reply.intent} (exp={expected_intent}), "
+            f"conf={reply.confidence:.2f}, text='{reply.text}'"
+        )
+
+    total = len(cases)
+    print(f"[чат-тест] accuracy={passed}/{total} ({(100.0 * passed / total):.1f}%)")
+
+
 def cmd_app() -> None:
     from app import run_app
 
@@ -213,6 +270,12 @@ def parse_args() -> argparse.Namespace:
     chat.add_argument("--seed", type=int, default=42)
     chat.add_argument("--auto-train", action="store_true")
 
+    test_chat = subparsers.add_parser("test-chat", help="Прогнати швидкий тест чату.")
+    test_chat.add_argument("--dataset-path", type=str, default="modules/chat/data/intents.json")
+    test_chat.add_argument("--model-path", type=str, default="models/chat_intent.pkl")
+    test_chat.add_argument("--threshold", type=float, default=0.25)
+    test_chat.add_argument("--seed", type=int, default=42)
+
     subparsers.add_parser("app", help="Запустити GUI-лаунчер.")
     subparsers.add_parser("app-chat", help="Запустити окремий застосунок чату.")
     subparsers.add_parser("app-snake", help="Запустити окремий застосунок змійки.")
@@ -234,6 +297,8 @@ def main() -> None:
         cmd_train_chat(kernel, args)
     elif args.command == "chat":
         cmd_chat(kernel, args)
+    elif args.command == "test-chat":
+        cmd_test_chat(kernel, args)
     elif args.command == "app":
         cmd_app()
     elif args.command == "app-chat":
