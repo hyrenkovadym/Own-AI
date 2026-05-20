@@ -8,8 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 
-from .local_llm import OllamaClient
 from .model import NeuralIntentModel
+from .programmer_agent import LocalProgrammerAgent
 
 
 @dataclass
@@ -30,7 +30,6 @@ class ChatReply:
 class ChatModule:
     name = "chat"
     DEFAULT_FALLBACK_QUEUE_PATH = "modules/chat/data/fallback_queue.json"
-    DEFAULT_CODER_MODEL = "qwen2.5-coder:7b"
 
     def __init__(self) -> None:
         self._kernel = None
@@ -39,7 +38,7 @@ class ChatModule:
         self._sessions: dict[str, deque[str]] = {}
         self._session_bot_names: dict[str, str] = {}
         self._memory_turns = 5
-        self._ollama = OllamaClient()
+        self._programmer = LocalProgrammerAgent(Path.cwd())
 
     def on_load(self, kernel) -> None:
         self._kernel = kernel
@@ -140,7 +139,6 @@ class ChatModule:
         model_path: str = "models/chat_intent.pkl",
         confidence_threshold: float = 0.22,
         session_id: str = "default",
-        coder_model: str = DEFAULT_CODER_MODEL,
     ) -> ChatReply:
         text = user_text.strip()
         if not text:
@@ -163,22 +161,10 @@ class ChatModule:
                 self._remember(session_id, text)
                 return ChatReply(intent="name", confidence=1.0, text=f"Я {custom_name}.")
 
-        if self._ollama.is_available():
-            system_prompt = (
-                "Ти локальний асистент-програміст у desktop-проєкті користувача. "
-                "Відповідай українською, коротко і практично. "
-                "Для запитів по коду спершу дай міні-план (1-4 кроки), потім робочий код/команди. "
-                "Не вигадуй факти про файли, якщо їх не бачиш."
-            )
-            llm = self._ollama.generate(
-                prompt=text,
-                model=(coder_model or self.DEFAULT_CODER_MODEL).strip(),
-                system=system_prompt,
-                temperature=0.15,
-            )
-            if llm.ok:
-                self._remember(session_id, text)
-                return ChatReply(intent="programmer", confidence=0.99, text=llm.text)
+        prog_intent, prog_conf, prog_text = self._programmer.reply(text)
+        if prog_text:
+            self._remember(session_id, text)
+            return ChatReply(intent=prog_intent, confidence=prog_conf, text=prog_text)
 
         fallback = self.reply(
             user_text=text,
@@ -186,13 +172,6 @@ class ChatModule:
             confidence_threshold=confidence_threshold,
             session_id=session_id,
         )
-        if fallback.intent == "fallback":
-            msg = (
-                "Я ще не маю локальної coding-моделі або вона вимкнена. "
-                "Щоб отримати режим програміста, запусти Ollama і встанови модель "
-                f"`{self.DEFAULT_CODER_MODEL}`. Потім пиши задачу прямо в чат."
-            )
-            return ChatReply(intent="programmer_unavailable", confidence=0.0, text=msg)
         return fallback
 
     def teach(

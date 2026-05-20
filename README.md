@@ -61,15 +61,15 @@ Teach from chat CLI:
 3. Enable `Режим розробника` if you want dataset/teaching controls.
 4. Use `Role=programmer` to switch to coding assistant behavior.
 
-Programmer mode uses local Ollama if available:
+Programmer mode is fully local and has no external API dependency.
+It supports practical commands:
 
-```bash
-ollama pull qwen2.5-coder:7b
-ollama run qwen2.5-coder:7b
-```
-
-Then return to chat app and keep `Coder model=qwen2.5-coder:7b`.
-If Ollama is not running, app shows a clear fallback hint.
+- `/help`
+- `/ls [path]`
+- `/read <file>`
+- `/find <text>`
+- `/tests`
+- `/plan <task>`
 
 Fallback self-learning queue:
 

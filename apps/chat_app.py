@@ -22,7 +22,6 @@ class ChatApp(tk.Tk):
         self._busy = False
         self._developer_mode = tk.BooleanVar(value=False)
         self._role_var = tk.StringVar(value="programmer")
-        self._coder_model_var = tk.StringVar(value="qwen2.5-coder:7b")
 
         apply_dark_style(self)
         self._build_layout()
@@ -50,8 +49,6 @@ class ChatApp(tk.Tk):
             width=14,
         )
         role.pack(side=tk.LEFT, padx=(8, 12))
-        ttk.Label(mode_row, text="Coder model:").pack(side=tk.LEFT)
-        ttk.Entry(mode_row, textvariable=self._coder_model_var, width=22).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Checkbutton(
             mode_row,
             text="Режим розробника",
@@ -214,7 +211,6 @@ class ChatApp(tk.Tk):
                         model_path=str(model_path),
                         confidence_threshold=float(self.threshold_var.get().strip()),
                         session_id=self.session_var.get().strip() or "desktop",
-                        coder_model=self._coder_model_var.get().strip() or "qwen2.5-coder:7b",
                     )
                 else:
                     reply = module.reply(
