@@ -1,7 +1,10 @@
 ﻿from __future__ import annotations
 
 import argparse
+import csv
+import json
 from pathlib import Path
+from typing import Any
 
 from core import Kernel, ModuleSpec
 
@@ -12,6 +15,48 @@ def build_kernel() -> Kernel:
         ModuleSpec(name="snake", entrypoint="modules.snake.entry"),
     ]
     return Kernel(specs=specs)
+
+
+def _metrics_record_base() -> dict[str, str]:
+    from datetime import datetime, timezone
+
+    return {"timestamp_utc": datetime.now(timezone.utc).isoformat()}
+
+
+def _append_metrics_record(metrics_path: str, record: dict[str, Any]) -> Path:
+    path = Path(metrics_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    full_record = {**_metrics_record_base(), **record}
+    suffix = path.suffix.lower()
+
+    if suffix == ".json":
+        if path.exists():
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                payload = []
+            if not isinstance(payload, list):
+                payload = []
+        else:
+            payload = []
+        payload.append(full_record)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return path
+
+    if suffix == ".jsonl":
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(full_record, ensure_ascii=False) + "\n")
+        return path
+
+    # Default: append as CSV.
+    fieldnames = list(full_record.keys())
+    write_header = not path.exists() or path.stat().st_size == 0
+    with path.open("a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(full_record)
+    return path
 
 
 def cmd_modules(kernel: Kernel) -> None:
@@ -47,6 +92,28 @@ def cmd_train(kernel: Kernel, args: argparse.Namespace) -> None:
         f"resumed={stats.resumed_from_model}, "
         f"epsilon={stats.epsilon_start:.4f}->{stats.epsilon_end:.4f}"
     )
+    if args.metrics_path:
+        out_path = _append_metrics_record(
+            args.metrics_path,
+            {
+                "run_type": "train",
+                "module": "snake",
+                "episodes": stats.episodes,
+                "avg_score_last_100": f"{stats.avg_score_last_100:.6f}",
+                "best_score": stats.best_score,
+                "best_fill_percent": f"{stats.best_fill_percent:.4f}",
+                "wins": stats.wins,
+                "q_states": stats.q_states,
+                "total_episodes": stats.total_episodes,
+                "goal_score_requested": stats.goal_score_requested,
+                "goal_score_effective": stats.goal_score_effective,
+                "epsilon_start": f"{stats.epsilon_start:.8f}",
+                "epsilon_end": f"{stats.epsilon_end:.8f}",
+                "resumed_from_model": stats.resumed_from_model,
+                "model_path": stats.model_path,
+            },
+        )
+        print(f"[metrics] saved: {out_path}")
 
 
 def cmd_play(kernel: Kernel, args: argparse.Namespace) -> None:
@@ -70,6 +137,26 @@ def cmd_play(kernel: Kernel, args: argparse.Namespace) -> None:
         f"goal={stats.goal_score_requested}->{stats.goal_score_effective}, "
         f"model={stats.model_path}"
     )
+    if args.metrics_path:
+        model_info = module.get_model_info(model_path=args.model_path)
+        out_path = _append_metrics_record(
+            args.metrics_path,
+            {
+                "run_type": "eval",
+                "module": "snake",
+                "episodes": stats.episodes,
+                "avg_score": f"{stats.avg_score:.6f}",
+                "best_score": stats.best_score,
+                "best_fill_percent": f"{stats.best_fill_percent:.4f}",
+                "wins": stats.wins,
+                "q_states": model_info.q_states,
+                "total_episodes": model_info.total_episodes,
+                "goal_score_requested": stats.goal_score_requested,
+                "goal_score_effective": stats.goal_score_effective,
+                "model_path": stats.model_path,
+            },
+        )
+        print(f"[metrics] saved: {out_path}")
 
 
 def cmd_train_chat(kernel: Kernel, args: argparse.Namespace) -> None:
@@ -239,7 +326,7 @@ def parse_args() -> argparse.Namespace:
     train = subparsers.add_parser("train", help="Тренувати модель.")
     train.add_argument("module", choices=["snake"])
     train.add_argument("--episodes", type=int, default=3000)
-    train.add_argument("--max-steps", type=int, default=250, help="0 = мʼяко без обмеження довжини епізоду.")
+    train.add_argument("--max-steps", type=int, default=250, help="0 = м'яко без обмеження довжини епізоду.")
     train.add_argument("--width", type=int, default=10)
     train.add_argument("--height", type=int, default=10)
     train.add_argument("--model-path", type=str, default="models/snake_q.pkl")
@@ -247,16 +334,28 @@ def parse_args() -> argparse.Namespace:
     train.add_argument("--log-every", type=int, default=250)
     train.add_argument("--fresh-start", action="store_true", help="Почати з нуля (ігнорувати попередню модель).")
     train.add_argument("--goal-score", type=int, default=100, help="Бажаний рахунок перемоги (обрізається до меж сітки).")
+    train.add_argument(
+        "--metrics-path",
+        type=str,
+        default="",
+        help="Опційно: шлях для експорту метрик (CSV/JSON/JSONL).",
+    )
 
     play = subparsers.add_parser("play", help="Оцінити натреновану модель.")
     play.add_argument("module", choices=["snake"])
     play.add_argument("--episodes", type=int, default=10)
-    play.add_argument("--max-steps", type=int, default=250, help="0 = мʼяко без обмеження довжини епізоду.")
+    play.add_argument("--max-steps", type=int, default=250, help="0 = м'яко без обмеження довжини епізоду.")
     play.add_argument("--width", type=int, default=10)
     play.add_argument("--height", type=int, default=10)
     play.add_argument("--model-path", type=str, default="models/snake_q.pkl")
     play.add_argument("--seed", type=int, default=123)
     play.add_argument("--goal-score", type=int, default=100, help="Бажаний рахунок перемоги (обрізається до меж сітки).")
+    play.add_argument(
+        "--metrics-path",
+        type=str,
+        default="",
+        help="Опційно: шлях для експорту метрик (CSV/JSON/JSONL).",
+    )
 
     train_chat = subparsers.add_parser("train-chat", help="Тренувати чат-модель.")
     train_chat.add_argument("--dataset-path", type=str, default="modules/chat/data/intents.json")

@@ -9,3 +9,5 @@ env/
 models/
 *.log
 modules/chat/data/fallback_queue.json
+.pytest_cache/
+runs/
